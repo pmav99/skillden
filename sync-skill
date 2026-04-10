@@ -1,0 +1,523 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+
+
+ROOT_DIR = Path(__file__).resolve().parent
+MANIFEST_FILE = ROOT_DIR / "manifest.json"
+SKILLS_DIR = ROOT_DIR / "skills"
+MAX_FETCH_WORKERS = 8
+
+
+@dataclass
+class Skill:
+    name: str
+    repo: str
+    path: str
+    ref: str
+    commit: str = ""
+    tree: str = ""
+
+
+@dataclass
+class Status:
+    state: str
+    upstream_commit: str = ""
+    current_tree: str = ""
+    detail: str = ""
+
+
+@dataclass
+class PrefetchResult:
+    checkout: RepoCheckout | None = None
+    error: str = ""
+
+
+class SyncError(RuntimeError):
+    pass
+
+
+def print_commands() -> None:
+    print("Usage:")
+    print("  ./sync-skill list")
+    print("  ./sync-skill update-all")
+    print("  ./sync-skill update <skill>")
+    print("  ./sync-skill add")
+    print()
+    print("Subcommands:")
+    print("  list        Fetch upstream changes and show skill status.")
+    print("  update-all  Fetch upstream changes and update every skill.")
+    print("  update      Fetch upstream changes and update one skill.")
+    print("  add         Add a skill to manifest.json.")
+
+
+def validate_rel_path(value: str, label: str) -> None:
+    path = PurePosixPath(value)
+    if not value or path.is_absolute() or ".." in path.parts or value == ".":
+        raise SyncError(f"invalid {label}: {value}")
+
+
+def run_git(args: list[str], cwd: Path | None = None) -> str:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.strip() or exc.stdout.strip() or "git command failed"
+        raise SyncError(stderr) from exc
+    return result.stdout.strip()
+
+
+def load_manifest(*, allow_missing: bool = False) -> dict[str, Skill]:
+    if not MANIFEST_FILE.is_file():
+        if allow_missing:
+            return {}
+        raise SyncError(f"missing manifest: {MANIFEST_FILE}")
+
+    with MANIFEST_FILE.open(encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    if not isinstance(data, dict) or not isinstance(data.get("skills"), dict):
+        raise SyncError("manifest must contain a top-level 'skills' object")
+
+    skills: dict[str, Skill] = {}
+    for name, raw in data["skills"].items():
+        if not isinstance(name, str):
+            raise SyncError("skill names must be strings")
+        validate_rel_path(name, f"skill name for {name}")
+        if not isinstance(raw, dict):
+            raise SyncError(f"skill entry for {name} must be an object")
+
+        repo = raw.get("repo")
+        path = raw.get("path")
+        ref = raw.get("ref")
+        commit = raw.get("commit", "")
+        tree = raw.get("tree", "")
+
+        for field_name, field_value in (
+            ("repo", repo),
+            ("path", path),
+            ("ref", ref),
+            ("commit", commit),
+            ("tree", tree),
+        ):
+            if not isinstance(field_value, str):
+                raise SyncError(f"{field_name} for {name} must be a string")
+            if field_name in {"repo", "path", "ref"} and not field_value:
+                raise SyncError(f"{field_name} for {name} must not be empty")
+
+        validate_rel_path(path, f"path for {name}")
+
+        skills[name] = Skill(
+            name=name,
+            repo=repo,
+            path=path,
+            ref=ref,
+            commit=commit,
+            tree=tree,
+        )
+
+    return skills
+
+
+def save_manifest(skills: dict[str, Skill]) -> None:
+    payload = {"skills": {}}
+    for name in sorted(skills):
+        skill = skills[name]
+        payload["skills"][name] = {
+            "repo": skill.repo,
+            "path": skill.path,
+            "ref": skill.ref,
+            "commit": skill.commit,
+            "tree": skill.tree,
+        }
+
+    temp_file = MANIFEST_FILE.with_name(f"{MANIFEST_FILE.name}.tmp")
+    with temp_file.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+    temp_file.replace(MANIFEST_FILE)
+
+
+class RepoCheckout:
+    def __init__(self, repo: str, ref: str) -> None:
+        self.repo = repo
+        self.ref = ref
+        self.tempdir = tempfile.TemporaryDirectory(prefix="sync-skill.")
+        self.path = Path(self.tempdir.name) / "repo"
+        self.paths: set[str] = set()
+
+        run_git(
+            [
+                "clone",
+                "--quiet",
+                "--depth",
+                "1",
+                "--single-branch",
+                "--sparse",
+                "--branch",
+                ref,
+                repo,
+                str(self.path),
+            ]
+        )
+        self.head_commit = run_git(["rev-parse", "HEAD"], cwd=self.path)
+
+    def ensure_path(self, source_path: str) -> Path:
+        if source_path not in self.paths:
+            self.paths.add(source_path)
+            run_git(
+                ["sparse-checkout", "set", "--no-cone", *sorted(self.paths)],
+                cwd=self.path,
+            )
+
+        source_dir = self.path / source_path
+        if not source_dir.is_dir():
+            raise SyncError(f"missing directory at {source_path} in {self.repo}@{self.ref}")
+        return source_dir
+
+    def tree_hash(self, source_path: str) -> str:
+        self.ensure_path(source_path)
+        return run_git(["rev-parse", f"HEAD:{source_path}"], cwd=self.path)
+
+    def copy_skill(self, source_path: str, dest_path: Path) -> tuple[str, str]:
+        source_dir = self.ensure_path(source_path)
+        skill_file = source_dir / "SKILL.md"
+        if not skill_file.is_file():
+            raise SyncError(f"{source_path} does not contain SKILL.md")
+
+        tree = self.tree_hash(source_path)
+
+        with tempfile.TemporaryDirectory(prefix="sync-install.", dir=SKILLS_DIR) as temp_root:
+            staged_path = Path(temp_root) / "skill"
+            shutil.copytree(source_dir, staged_path)
+
+            if dest_path.is_dir():
+                shutil.rmtree(dest_path)
+            elif dest_path.exists():
+                dest_path.unlink()
+
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(staged_path), str(dest_path))
+
+        return self.head_commit, tree
+
+
+def short_hash(value: str) -> str:
+    return value[:12] if value else "-"
+
+
+def summarize(text: str, limit: int = 80) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
+
+
+def format_table(headers: list[str], rows: list[list[str]]) -> str:
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for index, value in enumerate(row):
+            widths[index] = max(widths[index], len(value))
+
+    lines = []
+    lines.append("  ".join(header.ljust(widths[index]) for index, header in enumerate(headers)))
+    lines.append("  ".join("-" * widths[index] for index in range(len(headers))))
+    for row in rows:
+        lines.append("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
+    return "\n".join(lines)
+
+
+def repo_key(skill: Skill) -> tuple[str, str]:
+    return (skill.repo, skill.ref)
+
+
+def select_skills(skills: dict[str, Skill], names: list[str]) -> list[Skill]:
+    selected: list[Skill] = []
+    missing: list[str] = []
+    for name in names:
+        skill = skills.get(name)
+        if skill is None:
+            missing.append(name)
+        else:
+            selected.append(skill)
+
+    if missing:
+        joined = ", ".join(missing)
+        raise SyncError(f"skill not found in manifest: {joined}")
+
+    return selected
+
+
+def prefetch_checkouts(selected_skills: list[Skill]) -> dict[tuple[str, str], PrefetchResult]:
+    targets: dict[tuple[str, str], Skill] = {}
+    for skill in selected_skills:
+        targets.setdefault(repo_key(skill), skill)
+
+    if not targets:
+        return {}
+
+    results: dict[tuple[str, str], PrefetchResult] = {}
+    workers = min(MAX_FETCH_WORKERS, len(targets))
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(RepoCheckout, skill.repo, skill.ref): key
+            for key, skill in targets.items()
+        }
+        for future in as_completed(future_map):
+            key = future_map[future]
+            try:
+                checkout = future.result()
+            except SyncError as exc:
+                results[key] = PrefetchResult(error=str(exc))
+            except Exception as exc:  # pragma: no cover - defensive guard
+                results[key] = PrefetchResult(error=str(exc))
+            else:
+                results[key] = PrefetchResult(checkout=checkout)
+
+    return results
+
+
+def classify_issue(message: str) -> str:
+    lowered = message.lower()
+    if message.startswith("missing directory at "):
+        return "missing-path"
+    if message.endswith("does not contain SKILL.md"):
+        return "invalid-skill"
+    if "remote branch" in lowered and "not found" in lowered:
+        return "missing-ref"
+    if "repository not found" in lowered:
+        return "missing-upstream"
+    if "does not appear to be a git repository" in lowered:
+        return "missing-upstream"
+    return "upstream-error"
+
+
+def status_for_skill(
+    skill: Skill,
+    prefetch: PrefetchResult,
+) -> Status:
+    if prefetch.error:
+        return Status(state=classify_issue(prefetch.error), detail=prefetch.error)
+
+    checkout = prefetch.checkout
+    if checkout is None:
+        return Status(state="upstream-error", detail="missing checkout")
+
+    try:
+        current_tree = checkout.tree_hash(skill.path)
+    except SyncError as exc:
+        return Status(
+            state=classify_issue(str(exc)),
+            upstream_commit=checkout.head_commit,
+            detail=str(exc),
+        )
+
+    dest_path = SKILLS_DIR / skill.name
+    upstream_commit = checkout.head_commit
+
+    if not skill.commit:
+        state = "new"
+    elif not dest_path.exists():
+        state = "missing-local"
+    elif not skill.tree:
+        state = "current" if skill.commit == upstream_commit else "update"
+    elif skill.tree == current_tree:
+        state = "current" if skill.commit == upstream_commit else "same-content"
+    else:
+        state = "update"
+
+    return Status(
+        state=state,
+        upstream_commit=upstream_commit,
+        current_tree=current_tree,
+    )
+
+
+def list_status(skills: dict[str, Skill]) -> int:
+    if not skills:
+        print("No skills configured.")
+        return 0
+
+    selected = [skills[name] for name in sorted(skills)]
+    prefetched = prefetch_checkouts(selected)
+    rows: list[list[str]] = []
+    exit_code = 0
+
+    for skill in selected:
+        status = status_for_skill(skill, prefetched[repo_key(skill)])
+        if status.detail:
+            exit_code = 1
+
+        rows.append(
+            [
+                skill.name,
+                status.state,
+                short_hash(skill.commit),
+                short_hash(status.upstream_commit),
+                skill.ref,
+                summarize(status.detail),
+            ]
+        )
+
+    print(format_table(["NAME", "STATE", "INSTALLED", "UPSTREAM", "REF", "DETAILS"], rows))
+    return exit_code
+
+
+def update_from_status(skill: Skill, checkout: RepoCheckout, status: Status) -> tuple[str, bool]:
+    dest_path = SKILLS_DIR / skill.name
+
+    if status.state == "current":
+        if not skill.tree:
+            skill.tree = status.current_tree
+            return f"{skill.name}: recorded tree {short_hash(status.current_tree)}", True
+        return f"{skill.name}: current", False
+
+    if status.state == "same-content":
+        skill.commit = status.upstream_commit
+        skill.tree = status.current_tree
+        return f"{skill.name}: refreshed to {short_hash(status.upstream_commit)} (same content)", True
+
+    commit, tree = checkout.copy_skill(skill.path, dest_path)
+    skill.commit = commit
+    skill.tree = tree
+    return f"{skill.name}: updated to {short_hash(commit)}", True
+
+
+def update_skills(skills: dict[str, Skill], names: list[str]) -> int:
+    if not skills:
+        print("No skills configured.")
+        return 0
+
+    selected = select_skills(skills, names)
+    prefetched = prefetch_checkouts(selected)
+    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    exit_code = 0
+
+    for skill in selected:
+        status = status_for_skill(skill, prefetched[repo_key(skill)])
+        if status.detail:
+            print(f"{skill.name}: skipped ({status.state}) {summarize(status.detail, 120)}")
+            exit_code = 1
+            continue
+
+        checkout = prefetched[repo_key(skill)].checkout
+        if checkout is None:
+            print(f"{skill.name}: skipped (upstream-error) missing checkout")
+            exit_code = 1
+            continue
+
+        try:
+            message, did_change = update_from_status(skill, checkout, status)
+        except SyncError as exc:
+            issue = classify_issue(str(exc))
+            print(f"{skill.name}: skipped ({issue}) {summarize(str(exc), 120)}")
+            exit_code = 1
+            continue
+
+        if did_change:
+            save_manifest(skills)
+        print(message)
+
+    return exit_code
+
+
+def prompt_required(label: str, default: str | None = None) -> str:
+    suffix = f" [{default}]" if default is not None else ""
+    while True:
+        value = input(f"{label}{suffix}: ").strip()
+        if value:
+            return value
+        if default is not None:
+            return default
+        print(f"{label} is required.")
+
+
+def add_skill(skills: dict[str, Skill]) -> int:
+    name = prompt_required("Skill name")
+    if name in skills:
+        raise SyncError(f"skill already exists in manifest: {name}")
+    validate_rel_path(name, f"skill name for {name}")
+
+    repo = prompt_required("Repo URL")
+    path = prompt_required("Skill path")
+    validate_rel_path(path, f"path for {name}")
+    ref = prompt_required("Ref", "main")
+
+    skills[name] = Skill(
+        name=name,
+        repo=repo,
+        path=path,
+        ref=ref,
+        commit="",
+        tree="",
+    )
+    save_manifest(skills)
+    print(f"Added {name}.")
+    print(f"Run ./sync-skill update {name} to install it.")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) == 1:
+        print_commands()
+        return 0
+
+    command = argv[1]
+    if command in {"-h", "--help", "help"}:
+        print_commands()
+        return 0
+
+    if command == "list":
+        if len(argv) != 2:
+            print_commands()
+            return 1
+        return list_status(load_manifest())
+
+    if command == "update-all":
+        if len(argv) != 2:
+            print_commands()
+            return 1
+        skills = load_manifest()
+        return update_skills(skills, sorted(skills))
+
+    if command == "update":
+        if len(argv) != 3:
+            print_commands()
+            return 1
+        skills = load_manifest()
+        return update_skills(skills, [argv[2]])
+
+    if command == "add":
+        if len(argv) != 2:
+            print_commands()
+            return 1
+        return add_skill(load_manifest(allow_missing=True))
+
+    print(f"error: unknown subcommand: {command}", file=sys.stderr)
+    print_commands()
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv))
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        raise SystemExit(130)
+    except SyncError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(1)

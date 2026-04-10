@@ -1,0 +1,18 @@
+{
+  "skills": {
+    "obsidian-cli": {
+      "repo": "https://github.com/kepano/obsidian-skills/",
+      "path": "skills/obsidian-cli",
+      "ref": "main",
+      "commit": "fa1e131a014576ff8f8919f191a7ca8d8fded39b",
+      "tree": "96254a554e480359de7b685571876f2e7f9ba57d"
+    },
+    "obsidian-markdown": {
+      "repo": "https://github.com/kepano/obsidian-skills/",
+      "path": "skills/obsidian-markdown",
+      "ref": "main",
+      "commit": "fa1e131a014576ff8f8919f191a7ca8d8fded39b",
+      "tree": "5caf5d9e7de204f3904216857545f2aa36bcfcac"
+    }
+  }
+}
