@@ -73,3 +73,22 @@ Sync state lives in `manifest.json`:
 ## How updates work
 
 For each update the script shallow-clones the requested `ref`, sparse-checks out only the skill's directory, verifies it contains a `SKILL.md`, copies it into `./vendored/<name>`, and rewrites the pinned `commit` and `tree` in `manifest.json`. Repos that disappear upstream are reported and skipped rather than aborting the whole run.
+
+## Why not subtrees or submodules
+
+This repo tracks skills, not upstream repositories.
+
+`skillden` vendors exactly the skill directory named in `manifest.json` and records the pinned upstream `commit` plus the directory `tree`. That keeps the local layout small and focused on the installed artifact.
+
+Git submodules are a poor fit here because they attach an entire upstream repository at a fixed path in your working tree. That is awkward when one upstream repo contains many unrelated skills, or when you only want one nested directory from that repo.
+
+Git subtrees are closer, but they still operate at the repository level and are designed around merging repository history into your own history. That adds Git-level complexity this tool does not need, and it still does not naturally model "track this one directory inside that repo and ignore the rest."
+
+The current approach keeps the contract simple:
+
+- `manifest.json` is the source of truth for vendored skills
+- `vendored/` contains only the fetched skill directories
+- `custom/` contains only local skills
+- `install` works from the local skill directories, not from Git wiring
+
+In short, submodules and subtrees solve repository composition. `skillden` solves directory-level skill vendoring.
