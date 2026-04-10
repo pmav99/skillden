@@ -13,7 +13,8 @@ from pathlib import Path, PurePosixPath
 
 ROOT_DIR = Path(__file__).resolve().parent
 MANIFEST_FILE = ROOT_DIR / "manifest.json"
-SKILLS_DIR = ROOT_DIR / "skills"
+VENDORED_DIR = ROOT_DIR / "vendored"
+CUSTOM_DIR = ROOT_DIR / "custom"
 MAX_FETCH_WORKERS = 8
 
 
@@ -45,18 +46,31 @@ class SyncError(RuntimeError):
     pass
 
 
+INSTALL_TARGETS = [
+    Path.home() / ".claude" / "skills",
+    Path.home() / ".codex" / "skills",
+]
+
+INSTALL_SOURCE_DIRS = [
+    VENDORED_DIR,
+    CUSTOM_DIR,
+]
+
+
 def print_commands() -> None:
     print("Usage:")
-    print("  ./sync-skill list")
-    print("  ./sync-skill update-all")
-    print("  ./sync-skill update <skill>")
-    print("  ./sync-skill add")
+    print("  ./skillden list")
+    print("  ./skillden update-all")
+    print("  ./skillden update <skill>")
+    print("  ./skillden add")
+    print("  ./skillden install")
     print()
     print("Subcommands:")
     print("  list        Fetch upstream changes and show skill status.")
     print("  update-all  Fetch upstream changes and update every skill.")
     print("  update      Fetch upstream changes and update one skill.")
-    print("  add         Add a skill to manifest.json.")
+    print("  add         Add a vendored skill to manifest.json.")
+    print("  install     Symlink skills from ./vendored and ./custom into targets.")
 
 
 def validate_rel_path(value: str, label: str) -> None:
@@ -151,6 +165,37 @@ def save_manifest(skills: dict[str, Skill]) -> None:
     temp_file.replace(MANIFEST_FILE)
 
 
+def discover_skill_dirs(root_dir: Path) -> list[Path]:
+    if not root_dir.is_dir():
+        return []
+    return sorted(
+        p.parent for p in root_dir.glob("*/SKILL.md") if p.parent.is_dir()
+    )
+
+
+def discover_install_skills() -> dict[str, Path]:
+    found: dict[str, list[Path]] = {}
+
+    for root_dir in INSTALL_SOURCE_DIRS:
+        for skill_dir in discover_skill_dirs(root_dir):
+            found.setdefault(skill_dir.name, []).append(skill_dir)
+
+    duplicates = {
+        name: paths for name, paths in found.items() if len(paths) > 1
+    }
+    if duplicates:
+        details = "; ".join(
+            f"{name}: {', '.join(str(path) for path in paths)}"
+            for name, paths in sorted(duplicates.items())
+        )
+        raise SyncError(f"duplicate installed skill names: {details}")
+
+    return {
+        name: paths[0]
+        for name, paths in sorted(found.items())
+    }
+
+
 class RepoCheckout:
     def __init__(self, repo: str, ref: str) -> None:
         self.repo = repo
@@ -200,7 +245,7 @@ class RepoCheckout:
 
         tree = self.tree_hash(source_path)
 
-        with tempfile.TemporaryDirectory(prefix="sync-install.", dir=SKILLS_DIR) as temp_root:
+        with tempfile.TemporaryDirectory(prefix="sync-install.", dir=ROOT_DIR) as temp_root:
             staged_path = Path(temp_root) / "skill"
             shutil.copytree(source_dir, staged_path)
 
@@ -326,7 +371,7 @@ def status_for_skill(
             detail=str(exc),
         )
 
-    dest_path = SKILLS_DIR / skill.name
+    dest_path = VENDORED_DIR / skill.name
     upstream_commit = checkout.head_commit
 
     if not skill.commit:
@@ -378,7 +423,7 @@ def list_status(skills: dict[str, Skill]) -> int:
 
 
 def update_from_status(skill: Skill, checkout: RepoCheckout, status: Status) -> tuple[str, bool]:
-    dest_path = SKILLS_DIR / skill.name
+    dest_path = VENDORED_DIR / skill.name
 
     if status.state == "current":
         if not skill.tree:
@@ -404,7 +449,7 @@ def update_skills(skills: dict[str, Skill], names: list[str]) -> int:
 
     selected = select_skills(skills, names)
     prefetched = prefetch_checkouts(selected)
-    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    VENDORED_DIR.mkdir(parents=True, exist_ok=True)
     exit_code = 0
 
     for skill in selected:
@@ -467,7 +512,62 @@ def add_skill(skills: dict[str, Skill]) -> int:
     )
     save_manifest(skills)
     print(f"Added {name}.")
-    print(f"Run ./sync-skill update {name} to install it.")
+    print(f"Run ./skillden update {name} to fetch it into ./vendored.")
+    return 0
+
+
+def is_skillden_symlink(link: Path) -> bool:
+    if not link.is_symlink():
+        return False
+    try:
+        target = link.resolve(strict=False)
+    except OSError:
+        return False
+    return any(root in target.parents or target == root for root in INSTALL_SOURCE_DIRS)
+
+
+def install_skills() -> int:
+    skills_by_name = discover_install_skills()
+    skill_names = set(skills_by_name)
+
+    errors: list[str] = []
+
+    for target_dir in INSTALL_TARGETS:
+        if not target_dir.is_dir():
+            target_dir.mkdir(parents=True, exist_ok=True)
+
+        # Remove stale symlinks that point into our local skill roots.
+        for entry in sorted(target_dir.iterdir()):
+            if is_skillden_symlink(entry) and entry.name not in skill_names:
+                entry.unlink()
+                print(f"  removed {entry}")
+
+        # Create/update symlinks for current skills
+        for name, skill_dir in skills_by_name.items():
+            link_path = target_dir / name
+            link_target = skill_dir.resolve()
+
+            if link_path.exists() or link_path.is_symlink():
+                if is_skillden_symlink(link_path):
+                    # Already ours -- update if target changed
+                    if link_path.resolve() == link_target:
+                        continue
+                    link_path.unlink()
+                else:
+                    errors.append(
+                        f"{link_path}: already exists and is not a skillden symlink"
+                    )
+                    continue
+
+            link_path.symlink_to(link_target)
+            print(f"  {link_path.name} -> {link_target}")
+
+    if errors:
+        print()
+        for error in errors:
+            print(f"error: {error}", file=sys.stderr)
+        return 1
+
     return 0
 
 
@@ -506,6 +606,12 @@ def main(argv: list[str]) -> int:
             print_commands()
             return 1
         return add_skill(load_manifest(allow_missing=True))
+
+    if command == "install":
+        if len(argv) != 2:
+            print_commands()
+            return 1
+        return install_skills()
 
     print(f"error: unknown subcommand: {command}", file=sys.stderr)
     print_commands()
