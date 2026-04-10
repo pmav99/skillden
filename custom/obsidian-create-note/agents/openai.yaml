@@ -1,0 +1,4 @@
+interface:
+  display_name: "Obsidian Note"
+  short_description: "Create MOC-linked notes from Markdown"
+  default_prompt: "Use $obsidian-create-note to turn this Markdown file into a note in my zettelkasten vault with MOC links."
